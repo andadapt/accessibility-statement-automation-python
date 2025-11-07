@@ -8,7 +8,7 @@ from scraper import fetch_html, extract_sections
 
 @click.group()
 def cli():
-    """Accessibility Scraper CLI"""
+    """Accessibility Statement Scraper CLI"""
 
 
 @cli.command()
@@ -55,13 +55,11 @@ def batch(db_path):
     """Scrape unique URLs and update all associated products."""
     conn = db.connect(db_path)
 
-    # Get all rows
     rows = conn.execute("SELECT product_name, url FROM pages").fetchall()
     if not rows:
         click.echo("⚠️  No rows found in the database. Run `import-links` first.")
         return
 
-    # Group by URL to avoid redundant scraping
     url_to_products = {}
     for row in rows:
         product_name, url = row["product_name"], row["url"]
@@ -91,7 +89,6 @@ def batch(db_path):
                     "fetched_at": int(time.time())
                 }
 
-        # Update products tied to this URL only
         for product_name in product_names:
             if not product_name:
                 click.echo(f"⚠️ Skipping update due to missing product_name for URL: {url}")
@@ -120,10 +117,61 @@ def validate(db_path):
 @cli.command()
 @click.option("--db-path", default="scraped_content.db")
 def count(db_path):
-    """Show total number of rows in the pages table."""
+    """Show detailed breakdown of rows and scraped fields."""
     conn = db.connect(db_path)
-    count = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
-    click.echo(f"📊 Total rows in pages: {count}")
+
+    total = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+    statuses = conn.execute("""
+        SELECT status, COUNT(*) AS count FROM pages GROUP BY status
+    """).fetchall()
+
+    def get_count(column, value="yes"):
+        return conn.execute(f"""
+            SELECT COUNT(*) FROM pages
+            WHERE {column} = ?
+        """, (value,)).fetchone()[0]
+
+    last_review_count = conn.execute("""
+        SELECT COUNT(*) FROM pages
+        WHERE last_review IS NOT NULL AND last_review != ''
+    """).fetchone()[0]
+
+    wcag_count = conn.execute("""
+        SELECT COUNT(*) FROM pages
+        WHERE wcag IS NOT NULL AND wcag != ''
+    """).fetchone()[0]
+
+    compliance_full = conn.execute("""
+        SELECT COUNT(*) FROM pages WHERE compliance_level = 'Fully Compliant'
+    """).fetchone()[0]
+
+    compliance_partial = conn.execute("""
+        SELECT COUNT(*) FROM pages WHERE compliance_level = 'Partially Compliant'
+    """).fetchone()[0]
+
+    compliance_not = conn.execute("""
+        SELECT COUNT(*) FROM pages WHERE compliance_level = 'Not Compliant'
+    """).fetchone()[0]
+
+    click.echo("\n📊 Database Summary:\n")
+    click.echo(f"Total products: {total}\n")
+
+    click.echo("Status breakdown:")
+    for row in statuses:
+        label = row['status'] or 'unknown'
+        click.echo(f"- {label.title()}: {row['count']}")
+
+    click.echo(f"\n✅ Feedback section present: {get_count('feedback_present')} / {total}")
+    click.echo(f"✅ Enforcement section present: {get_count('enforcement_present')} / {total}")
+    click.echo(f"📅 Last reviewed date found: {last_review_count} / {total}")
+    click.echo(f"📜 WCAG version detected: {wcag_count} / {total}\n")
+
+    click.echo("Compliance levels:")
+    click.echo(f"- Fully compliant: {compliance_full}")
+    click.echo(f"- Partially compliant: {compliance_partial}")
+    click.echo(f"- Not compliant: {compliance_not}")
+
+    click.echo("\n✅ Count complete.")
 
 
 @cli.command()
@@ -154,6 +202,30 @@ def report(db_path):
         click.echo(f"- {key.replace('_', ' ').title()}: {value} / {total} ({pct}%)")
 
     click.echo("\n✅ Report complete.")
+
+
+@cli.command()
+@click.option("--db-path", default="scraped_content.db")
+def summary(db_path):
+    """Show a breakdown of scrape results by status."""
+    conn = db.connect(db_path)
+    total = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+
+    counts = conn.execute("""
+        SELECT status, COUNT(*) AS count
+        FROM pages
+        GROUP BY status
+    """).fetchall()
+
+    click.echo("\n📊 Scrape Summary:\n")
+    click.echo(f"Total products: {total}\n")
+
+    for row in counts:
+        label = row['status'] or 'unknown'
+        pct = round((row['count'] / total) * 100, 2)
+        click.echo(f"- {label.title()}: {row['count']} ({pct}%)")
+
+    click.echo("\n✅ Summary complete.")
 
 
 if __name__ == "__main__":
