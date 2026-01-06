@@ -2,6 +2,9 @@
 import click
 import time
 import csv
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import db
 from scraper import fetch_html, extract_sections
 
@@ -39,11 +42,15 @@ def import_links(links_file, db_path):
                 click.echo(f"⚠️ Row {i}: Missing product name, skipping")
                 continue
 
-            db.upsert_page(conn, product_name, {
-                "portfolio": portfolio,
-                "url": url or None,
-                "status": status,
-            })
+            db.upsert_page(
+                conn,
+                product_name,
+                {
+                    "portfolio": portfolio,
+                    "url": url or None,
+                    "status": status,
+                },
+            )
             click.echo(f"✅ Imported row {i}: '{product_name}' ({status})")
 
     click.echo("\n📥 Import complete.")
@@ -70,23 +77,26 @@ def batch(db_path):
     scraped_count = 0
 
     for url, product_names in url_to_products.items():
+        # ✅ Store ONLY a European day-first date string (DD/MM/YYYY)
+        scraped_date = datetime.now(ZoneInfo("Europe/London")).strftime("%d/%m/%Y")
+
         click.echo(f"\n🔗 Scraping: {url}")
         html = fetch_html(url)
 
         if not html:
             click.echo("⚠️  Failed to fetch page.")
-            status = {"status": "failed", "fetched_at": int(time.time())}
+            status = {"status": "failed", "fetched_at": scraped_date}
         else:
             scraped_data = extract_sections(html)
             if not any(scraped_data.values()):
                 click.echo("⚠️  Scrape yielded no content.")
-                status = {"status": "no_content", "fetched_at": int(time.time())}
+                status = {"status": "no_content", "fetched_at": scraped_date}
             else:
                 click.echo("✅ Successfully scraped content.")
                 status = {
                     **scraped_data,
                     "status": "success",
-                    "fetched_at": int(time.time())
+                    "fetched_at": scraped_date,
                 }
 
         for product_name in product_names:
@@ -97,7 +107,10 @@ def batch(db_path):
 
         scraped_count += 1
 
-    click.echo(f"\n🎉 Batch scrape complete! Scraped {scraped_count} unique URLs, Skipped (no URL): {skipped}")
+    click.echo(
+        f"\n🎉 Batch scrape complete! Scraped {scraped_count} unique URLs, "
+        f"Skipped (no URL): {skipped}"
+    )
 
 
 @cli.command()
@@ -105,7 +118,9 @@ def batch(db_path):
 def validate(db_path):
     """Check for potential bad rows (empty or null product_name)."""
     conn = db.connect(db_path)
-    rows = conn.execute("SELECT * FROM pages WHERE product_name IS NULL OR product_name = ''").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM pages WHERE product_name IS NULL OR product_name = ''"
+    ).fetchall()
     if not rows:
         click.echo("✅ No bad rows found.")
     else:
@@ -158,7 +173,7 @@ def count(db_path):
 
     click.echo("Status breakdown:")
     for row in statuses:
-        label = row['status'] or 'unknown'
+        label = row["status"] or "unknown"
         click.echo(f"- {label.title()}: {row['count']}")
 
     click.echo(f"\n✅ Feedback section present: {get_count('feedback_present')} / {total}")
@@ -221,8 +236,8 @@ def summary(db_path):
     click.echo(f"Total products: {total}\n")
 
     for row in counts:
-        label = row['status'] or 'unknown'
-        pct = round((row['count'] / total) * 100, 2)
+        label = row["status"] or "unknown"
+        pct = round((row["count"] / total) * 100, 2) if total else 0
         click.echo(f"- {label.title()}: {row['count']} ({pct}%)")
 
     click.echo("\n✅ Summary complete.")

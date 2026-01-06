@@ -8,7 +8,7 @@ DEFAULT_DB = os.environ.get("SCRAPER_DB", "scraped_content.db")
 def connect(db_path: str = DEFAULT_DB):
     """Connect to the SQLite database with sane defaults."""
     conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row  # Better for debugging output
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
@@ -23,7 +23,7 @@ def init_db(db_path: str = DEFAULT_DB):
         product_name TEXT UNIQUE,
         portfolio TEXT,
         url TEXT,
-        fetched_at INTEGER,
+        fetched_at TEXT,               -- DD/MM/YYYY
         feedback TEXT,
         enforcement TEXT,
         compliance_status TEXT,
@@ -45,11 +45,11 @@ def init_db(db_path: str = DEFAULT_DB):
 def upsert_page(conn, product_name: str, data: dict):
     """Insert or update a page record based on product_name (unique)."""
 
-    if not product_name:  # Strict check for safety
+    if not product_name:
         print(f"⚠️  Skipping upsert: Invalid product_name '{product_name}'")
         return
 
-    fields = ["product_name"] + list(data.keys())  # Ensure product_name is first
+    fields = ["product_name"] + list(data.keys())
     values = [product_name] + list(data.values())
 
     placeholders = ", ".join(["?"] * len(fields))
