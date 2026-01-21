@@ -2,6 +2,10 @@
 import click
 import time
 import csv
+import os
+import re
+import json
+from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -9,238 +13,260 @@ import db
 from scraper import fetch_html, extract_sections
 
 
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
+
+def sanitize_table_name(name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_").lower()
+    if not name:
+        name = "table"
+    if name[0].isdigit():
+        name = f"t_{name}"
+    return name
+
+
+def quote_ident(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def ensure_table(conn, table_name: str):
+    conn.execute(f"""
+    CREATE TABLE IF NOT EXISTS {quote_ident(table_name)} (
+        id INTEGER PRIMARY KEY,
+        product_name TEXT UNIQUE,
+        portfolio TEXT,
+        url TEXT,
+        fetched_at TEXT,
+        feedback TEXT,
+        enforcement TEXT,
+        compliance_status TEXT,
+        preparation TEXT,
+        non_accessible TEXT,
+        feedback_present TEXT,
+        enforcement_present TEXT,
+        last_review TEXT,
+        wcag TEXT,
+        compliance_level TEXT,
+        issue_text TEXT,
+        status TEXT DEFAULT ''
+    );
+    """)
+    conn.commit()
+
+
+def upsert_row(conn, table_name: str, product_name: str, data: dict):
+    if not product_name:
+        click.echo(f"⚠️  Skipping upsert: Invalid product_name '{product_name}'")
+        return
+
+    fields = ["product_name"] + list(data.keys())
+    values = [product_name] + list(data.values())
+
+    placeholders = ", ".join(["?"] * len(fields))
+    updates = ", ".join([f"{quote_ident(f)}=excluded.{quote_ident(f)}" for f in data.keys()])
+
+    conn.execute(
+        f"""
+        INSERT INTO {quote_ident(table_name)} ({", ".join(map(quote_ident, fields))})
+        VALUES ({placeholders})
+        ON CONFLICT(product_name) DO UPDATE SET {updates}
+        """,
+        values,
+    )
+    conn.commit()
+
+
+def dump_table_to_json(conn, table_name: str, out_path: Path):
+    rows = conn.execute(f"SELECT * FROM {quote_ident(table_name)}").fetchall()
+    data = [dict(r) for r in rows]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def scrape_table(conn, table_name: str):
+    rows = conn.execute(
+        f"SELECT product_name, url FROM {quote_ident(table_name)}"
+    ).fetchall()
+
+    url_map = {}
+    skipped = 0
+
+    for row in rows:
+        if row["url"]:
+            url_map.setdefault(row["url"], []).append(row["product_name"])
+        else:
+            skipped += 1
+
+    for url, products in url_map.items():
+        scraped_date = datetime.now(ZoneInfo("Europe/London")).strftime("%d/%m/%Y")
+
+        click.echo(f"\n🔗 [{table_name}] Scraping {url}")
+        html = fetch_html(url)
+
+        if not html:
+            status = {"status": "failed", "fetched_at": scraped_date}
+        else:
+            data = extract_sections(html)
+            if not any(data.values()):
+                status = {"status": "no_content", "fetched_at": scraped_date}
+            else:
+                status = {**data, "status": "success", "fetched_at": scraped_date}
+
+        for product in products:
+            upsert_row(conn, table_name, product, status)
+
+    return len(url_map), skipped
+
+
+def print_last_review_summary(conn, table_name: str):
+    """
+    Print how many rows per portfolio have a non-empty last_review.
+    """
+    rows = conn.execute(f"""
+        SELECT
+            portfolio,
+            COUNT(*) AS count
+        FROM {quote_ident(table_name)}
+        WHERE last_review IS NOT NULL
+          AND last_review != ''
+        GROUP BY portfolio
+        ORDER BY portfolio
+    """).fetchall()
+
+    click.echo(f"\n📊 Last review summary (table: {table_name})")
+
+    if not rows:
+        click.echo("  (no rows with last_review)")
+        return
+
+    for row in rows:
+        portfolio = row["portfolio"] or "(no portfolio)"
+        click.echo(f"- {portfolio}: {row['count']}")
+
+
+# -------------------------------------------------
+# CLI
+# -------------------------------------------------
+
 @click.group()
 def cli():
     """Accessibility Statement Scraper CLI"""
 
 
-@cli.command()
+@cli.command("run-all")
 @click.option("--db-path", default="scraped_content.db")
-def init(db_path):
-    """Initialize the database."""
-    db.init_db(db_path)
-    click.echo(f"✅ Database initialized at {db_path}")
+def run_all(db_path):
+    """
+    Monthly command:
+    - Wipes DB
+    - Imports all CSVs from inputs/
+    - Creates one table per CSV
+    - Scrapes all tables
+    - Prints per-portfolio last_review counts
+    - Exports outputs/<table>.json
+    """
+    base_dir = Path(__file__).resolve().parent
+    inputs_dir = base_dir / "inputs"
+    outputs_dir = base_dir / "outputs"
 
-
-@cli.command()
-@click.argument("links_file", type=click.Path(exists=True))
-@click.option("--db-path", default="scraped_content.db")
-def import_links(links_file, db_path):
-    """Import product, portfolio, and optional URL data from a CSV file."""
-    conn = db.init_db(db_path)
-
-    with open(links_file, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader, start=1):
-            product_name = row.get("Product Name", "").strip()
-            portfolio = row.get("Portfolio", "").strip()
-            url = row.get("Statement URL", "").strip()
-
-            status = "pending" if url else "no_url"
-
-            if not product_name:
-                click.echo(f"⚠️ Row {i}: Missing product name, skipping")
-                continue
-
-            db.upsert_page(
-                conn,
-                product_name,
-                {
-                    "portfolio": portfolio,
-                    "url": url or None,
-                    "status": status,
-                },
-            )
-            click.echo(f"✅ Imported row {i}: '{product_name}' ({status})")
-
-    click.echo("\n📥 Import complete.")
-
-
-@cli.command()
-@click.option("--db-path", default="scraped_content.db")
-def batch(db_path):
-    """Scrape unique URLs and update all associated products."""
-    conn = db.connect(db_path)
-
-    rows = conn.execute("SELECT product_name, url FROM pages").fetchall()
-    if not rows:
-        click.echo("⚠️  No rows found in the database. Run `import-links` first.")
+    if not inputs_dir.exists():
+        click.echo("❌ inputs/ folder not found")
         return
 
-    url_to_products = {}
-    for row in rows:
-        product_name, url = row["product_name"], row["url"]
-        if url:
-            url_to_products.setdefault(url, []).append(product_name)
+    csv_files = sorted(inputs_dir.glob("*.csv"))
+    if not csv_files:
+        click.echo("❌ No CSV files found in inputs/")
+        return
 
-    skipped = sum(1 for row in rows if not row["url"])
-    scraped_count = 0
+    # Wipe database
+    db_file = Path(db_path)
+    if not db_file.is_absolute():
+        db_file = base_dir / db_file
 
-    for url, product_names in url_to_products.items():
-        # ✅ Store ONLY a European day-first date string (DD/MM/YYYY)
-        scraped_date = datetime.now(ZoneInfo("Europe/London")).strftime("%d/%m/%Y")
+    if db_file.exists():
+        db_file.unlink()
+        click.echo("🧹 Database wiped")
 
-        click.echo(f"\n🔗 Scraping: {url}")
-        html = fetch_html(url)
+    conn = db.connect(str(db_file))
 
-        if not html:
-            click.echo("⚠️  Failed to fetch page.")
-            status = {"status": "failed", "fetched_at": scraped_date}
-        else:
-            scraped_data = extract_sections(html)
-            if not any(scraped_data.values()):
-                click.echo("⚠️  Scrape yielded no content.")
-                status = {"status": "no_content", "fetched_at": scraped_date}
-            else:
-                click.echo("✅ Successfully scraped content.")
-                status = {
-                    **scraped_data,
-                    "status": "success",
-                    "fetched_at": scraped_date,
-                }
+    tables = []
 
-        for product_name in product_names:
-            if not product_name:
-                click.echo(f"⚠️ Skipping update due to missing product_name for URL: {url}")
-                continue
-            db.upsert_page(conn, product_name, status)
+    # -----------------------------------------
+    # Import CSVs
+    # -----------------------------------------
+    for csv_path in csv_files:
+        table = sanitize_table_name(csv_path.stem)
+        tables.append(table)
 
-        scraped_count += 1
+        click.echo(f"\n📥 Importing {csv_path.name} → {table}")
+        ensure_table(conn, table)
 
-    click.echo(
-        f"\n🎉 Batch scrape complete! Scraped {scraped_count} unique URLs, "
-        f"Skipped (no URL): {skipped}"
-    )
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
 
+            for i, row in enumerate(reader, start=1):
 
-@cli.command()
-@click.option("--db-path", default="scraped_content.db")
-def validate(db_path):
-    """Check for potential bad rows (empty or null product_name)."""
-    conn = db.connect(db_path)
-    rows = conn.execute(
-        "SELECT * FROM pages WHERE product_name IS NULL OR product_name = ''"
-    ).fetchall()
-    if not rows:
-        click.echo("✅ No bad rows found.")
-    else:
-        click.echo(f"❗ Found {len(rows)} bad rows (missing product_name):")
-        for row in rows[:10]:
-            print(dict(row))
+                # -------- NORMALISE HEADERS & VALUES --------
+                row_norm = {}
+                for k, v in row.items():
+                    if k is None:
+                        continue
+                    nk = k.replace("\ufeff", "").replace("\u00a0", " ").strip()
+                    row_norm[nk] = (v or "").strip()
+                # --------------------------------------------
 
+                product_name = row_norm.get("Product Name", "")
+                portfolio = row_norm.get("Portfolio", "")
+                url = row_norm.get("Statement URL", "")
 
-@cli.command()
-@click.option("--db-path", default="scraped_content.db")
-def count(db_path):
-    """Show detailed breakdown of rows and scraped fields."""
-    conn = db.connect(db_path)
+                if url.lower() in {"", "null", "none", "na", "n/a", "working"}:
+                    url = ""
 
-    total = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
-    statuses = conn.execute("""
-        SELECT status, COUNT(*) AS count FROM pages GROUP BY status
-    """).fetchall()
+                status = "pending" if url else "no_url"
 
-    def get_count(column, value="yes"):
-        return conn.execute(f"""
-            SELECT COUNT(*) FROM pages
-            WHERE {column} = ?
-        """, (value,)).fetchone()[0]
+                if not product_name:
+                    click.echo(f"⚠️  {csv_path.name} row {i}: Missing product name, skipping")
+                    continue
 
-    last_review_count = conn.execute("""
-        SELECT COUNT(*) FROM pages
-        WHERE last_review IS NOT NULL AND last_review != ''
-    """).fetchone()[0]
+                upsert_row(
+                    conn,
+                    table,
+                    product_name,
+                    {
+                        "portfolio": portfolio,
+                        "url": url or None,
+                        "status": status,
+                    },
+                )
 
-    wcag_count = conn.execute("""
-        SELECT COUNT(*) FROM pages
-        WHERE wcag IS NOT NULL AND wcag != ''
-    """).fetchone()[0]
+        click.echo(f"✅ Imported {table}")
 
-    compliance_full = conn.execute("""
-        SELECT COUNT(*) FROM pages WHERE compliance_level = 'Fully Compliant'
-    """).fetchone()[0]
+    # -----------------------------------------
+    # Scrape
+    # -----------------------------------------
+    click.echo("\n🚀 Starting scrape")
+    for table in tables:
+        scraped, skipped = scrape_table(conn, table)
+        click.echo(f"✅ {table}: scraped {scraped} URLs, skipped {skipped}")
 
-    compliance_partial = conn.execute("""
-        SELECT COUNT(*) FROM pages WHERE compliance_level = 'Partially Compliant'
-    """).fetchone()[0]
+    # -----------------------------------------
+    # Last review summary (per portfolio)
+    # -----------------------------------------
+    click.echo("\n📌 Last reviewed counts by portfolio")
+    for table in tables:
+        print_last_review_summary(conn, table)
 
-    compliance_not = conn.execute("""
-        SELECT COUNT(*) FROM pages WHERE compliance_level = 'Not Compliant'
-    """).fetchone()[0]
+    # -----------------------------------------
+    # Export
+    # -----------------------------------------
+    click.echo("\n📤 Exporting JSON")
+    for table in tables:
+        out_file = outputs_dir / f"{table}.json"
+        dump_table_to_json(conn, table, out_file)
+        click.echo(f"✅ {out_file}")
 
-    click.echo("\n📊 Database Summary:\n")
-    click.echo(f"Total products: {total}\n")
-
-    click.echo("Status breakdown:")
-    for row in statuses:
-        label = row["status"] or "unknown"
-        click.echo(f"- {label.title()}: {row['count']}")
-
-    click.echo(f"\n✅ Feedback section present: {get_count('feedback_present')} / {total}")
-    click.echo(f"✅ Enforcement section present: {get_count('enforcement_present')} / {total}")
-    click.echo(f"📅 Last reviewed date found: {last_review_count} / {total}")
-    click.echo(f"📜 WCAG version detected: {wcag_count} / {total}\n")
-
-    click.echo("Compliance levels:")
-    click.echo(f"- Fully compliant: {compliance_full}")
-    click.echo(f"- Partially compliant: {compliance_partial}")
-    click.echo(f"- Not compliant: {compliance_not}")
-
-    click.echo("\n✅ Count complete.")
-
-
-@cli.command()
-@click.option("--db-path", default="scraped_content.db")
-def report(db_path):
-    """Show completion stats for key scraped fields."""
-    conn = db.connect(db_path)
-    total = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
-
-    def get_count(column):
-        return conn.execute(f"""
-            SELECT COUNT(*) FROM pages
-            WHERE {column} IS NOT NULL AND {column} != ''
-        """).fetchone()[0]
-
-    metrics = {
-        "last_review": get_count("last_review"),
-        "wcag": get_count("wcag"),
-        "compliance_level": get_count("compliance_level"),
-        "successful_scrapes": conn.execute(
-            "SELECT COUNT(*) FROM pages WHERE status = 'success'"
-        ).fetchone()[0],
-    }
-
-    click.echo("\n📊 Scrape Report:\n")
-    for key, value in metrics.items():
-        pct = round((value / total) * 100, 2) if total else 0
-        click.echo(f"- {key.replace('_', ' ').title()}: {value} / {total} ({pct}%)")
-
-    click.echo("\n✅ Report complete.")
-
-
-@cli.command()
-@click.option("--db-path", default="scraped_content.db")
-def summary(db_path):
-    """Show a breakdown of scrape results by status."""
-    conn = db.connect(db_path)
-    total = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
-
-    counts = conn.execute("""
-        SELECT status, COUNT(*) AS count
-        FROM pages
-        GROUP BY status
-    """).fetchall()
-
-    click.echo("\n📊 Scrape Summary:\n")
-    click.echo(f"Total products: {total}\n")
-
-    for row in counts:
-        label = row["status"] or "unknown"
-        pct = round((row["count"] / total) * 100, 2) if total else 0
-        click.echo(f"- {label.title()}: {row['count']} ({pct}%)")
-
-    click.echo("\n✅ Summary complete.")
+    click.echo("\n🎉 run-all complete")
 
 
 if __name__ == "__main__":

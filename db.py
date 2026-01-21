@@ -15,7 +15,10 @@ def connect(db_path: str = DEFAULT_DB):
 
 
 def init_db(db_path: str = DEFAULT_DB):
-    """Initialize the database with product-level uniqueness."""
+    """
+    Initialize the database with the legacy 'pages' table.
+    (Used by init/import-links/batch commands.)
+    """
     conn = connect(db_path)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS pages (
@@ -23,7 +26,7 @@ def init_db(db_path: str = DEFAULT_DB):
         product_name TEXT UNIQUE,
         portfolio TEXT,
         url TEXT,
-        fetched_at TEXT,               -- DD/MM/YYYY
+        fetched_at TEXT,          -- DD/MM/YYYY
         feedback TEXT,
         enforcement TEXT,
         compliance_status TEXT,
