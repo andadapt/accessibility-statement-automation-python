@@ -102,8 +102,7 @@ def scrape_table(conn, table_name: str):
         scraped_date = datetime.now(ZoneInfo("Europe/London")).strftime("%d/%m/%Y")
 
         click.echo(f"\n🔗 [{table_name}] Scraping {url}")
-        #html = fetch_html(url)
-        html = fetch_html(url, context={"table": table_name, "product_names": products})
+        html = fetch_html(url)
 
         if not html:
             status = {"status": "failed", "fetched_at": scraped_date}
