@@ -1,3 +1,5 @@
+# Accessibility statement web scraper
+
 ## Setup
 
 ### Prerequisites
@@ -75,6 +77,7 @@ Make sure these folders exist at the repo root (same level as `cli.py`):
 ```
 inputs/
 outputs/
+logs/
 ```
 
 Put your CSV files in `inputs/`.
